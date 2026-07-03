@@ -1,0 +1,22 @@
+lcms: avoid NaN when building BT.1886 transfer curves
+
+Backport of mpv 47f81c8d7e5e (fixes mpv#17439). After a Little-CMS change,
+cmsDetectBlackPoint can return a black point whose X/Z are slightly negative
+due to rounding; transformed into the source RGB space this yields negative
+src_black channels, and pow(negative, 1/gamma) is NaN — poisoning the BT.1886
+tone curve and rendering all SDR gray on the vo_gpu / libmpv-render ICC path.
+Bound src_black below by 0 before the pow().
+
+The iina-release/1.5.0 mpv this build uses predates the upstream fix.
+
+--- a/video/out/gpu/lcms.c
++++ b/video/out/gpu/lcms.c
+@@ -276,7 +276,7 @@
+         // Build the parametric BT.1886 transfer curve, one per channel
+         for (int i = 0; i < 3; i++) {
+             const double gamma = 2.40;
+-            double binv = pow(src_black[i], 1.0/gamma);
++            double binv = pow(MPMAX(0, src_black[i]), 1.0/gamma);
+             tonecurve[i] = cmsBuildParametricToneCurve(cms, 6,
+                     (double[4]){gamma, 1.0 - binv, binv, 0.0});
+         }

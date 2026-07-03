@@ -1,0 +1,211 @@
+name: build
+
+# Builds a custom IINA.app whose bundled dependencies are compiled from source with the
+# patches under patches/ applied. Today that is the FFmpeg MMT/TLV demuxer; the framework is
+# general — drop more .patch files into patches/<dependency>/ and they are applied in order.
+#
+# IINA's own CI downloads prebuilt dylibs (other/download_libs.sh -> iina.io). We instead build
+# the two IINA Homebrew formulas (ffmpeg-iina, mpv-iina) FROM SOURCE with our patches, then feed
+# the resulting dylib bundle into IINA's normal xcodebuild. The expensive FFmpeg+mpv build is
+# cached (keyed on the patch set + pinned versions), so ordinary runs skip it.
+
+on:
+  push:
+    branches: [main]
+    paths: ['patches/**', '.github/workflows/build.yml', 'manifest.env']
+  workflow_dispatch:
+    inputs:
+      iina_ref:
+        description: "IINA git ref to build against"
+        default: "ae76dcf73082c86770ffe0988d7d75d202d723d4"
+      force_rebuild_deps:
+        description: "Ignore the deps cache and rebuild FFmpeg+mpv"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # upload artifacts + (optional) release
+
+env:
+  # Pinned build inputs — see manifest.env (kept in sync for humans; the workflow reads these).
+  # Pinned to ae76dcf — the last IINA commit before an unrelated regression. Also keeps any future
+  # patches/iina source patch deterministic. Override via the iina_ref input.
+  IINA_REF: ${{ github.event.inputs.iina_ref || 'ae76dcf73082c86770ffe0988d7d75d202d723d4' }}
+  MPV_TAP_REF: "master"           # iina/homebrew-mpv-iina ref (formulas: ffmpeg-iina, mpv-iina)
+  XCODE_VERSION: "26.5"           # matches iina/iina ci.yml
+  CACHE_EPOCH: "1"                # bump to bust the deps cache manually
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - name: Checkout iina-builds
+        uses: actions/checkout@v4
+
+      - name: Checkout IINA
+        uses: actions/checkout@v4
+        with:
+          repository: iina/iina
+          ref: ${{ env.IINA_REF }}
+          path: iina
+
+      - name: Apply IINA source patches
+        run: |
+          shopt -s nullglob
+          for p in "$GITHUB_WORKSPACE"/patches/iina/*.patch; do
+            echo "iina-builds: applying $(basename "$p")"
+            patch -p1 -F3 -d iina -i "$p"
+          done
+
+      - name: Select Xcode
+        run: |
+          if [ -d "/Applications/Xcode_${XCODE_VERSION}.app" ]; then
+            sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
+          fi
+          xcodebuild -version
+          swift --version
+
+      - name: Compute cache key
+        id: keys
+        run: |
+          set -euo pipefail
+          IINA_SHA="$(git -C iina rev-parse HEAD)"
+          # Any change under patches/ (across all dependencies) busts the deps cache.
+          PATCH_HASH="$(find patches -type f -name '*.patch' | sort | xargs cat | shasum -a 256 | cut -c1-16)"
+          echo "iina_sha=$IINA_SHA" >> "$GITHUB_OUTPUT"
+          echo "patch_hash=$PATCH_HASH" >> "$GITHUB_OUTPUT"
+          echo "IINA $IINA_SHA / patches $PATCH_HASH"
+
+      - name: Restore built dependency bundle (patched FFmpeg + mpv)
+        id: deps_cache
+        if: ${{ github.event.inputs.force_rebuild_deps != 'true' }}
+        uses: actions/cache@v4
+        with:
+          path: iina/deps
+          key: deps-${{ runner.os }}-mpvtap${{ env.MPV_TAP_REF }}-patch${{ steps.keys.outputs.patch_hash }}-epoch${{ env.CACHE_EPOCH }}
+
+      - name: Build patched FFmpeg + mpv from source
+        if: ${{ steps.deps_cache.outputs.cache-hit != 'true' }}
+        run: |
+          set -euxo pipefail
+          # The patched formula runs `patch -i <workspace>/patches/...` during its build. Homebrew's
+          # build sandbox denies reads outside the build tree, so patch fails silently (no hunk
+          # rejects — it just can't open the file). Disable the sandbox; this is our own build.
+          export HOMEBREW_NO_SANDBOX=1
+          brew update
+          brew tap iina/homebrew-mpv-iina
+          FORMULA="$(brew formula ffmpeg-iina)"   # resolves the tapped formula's real path
+          test -f "$FORMULA" || { echo "::error::ffmpeg-iina formula not found at '$FORMULA'"; exit 1; }
+          PATCHDIR="$GITHUB_WORKSPACE/patches/ffmpeg"
+
+          # Inject our patch-apply step into ffmpeg-iina's install, right before ./configure.
+          # The Ruby snippet is kept literal (heredoc + awk insert) so #{...} is written into the
+          # formula, not evaluated here. The absolute patch dir is baked in so it doesn't depend on
+          # env propagation into Homebrew's sandbox. Purely additive: any patches/ffmpeg/*.patch.
+          # Use /usr/bin/patch by ABSOLUTE path — Homebrew's curated build PATH doesn't include it,
+          # so `system("patch", ...)` returned nil (patch never ran, hence the silent failure).
+          # Capture + print its output so any real reject is visible.
+          SNIPPET='    Dir.glob("__PATCHDIR__/*.patch").sort.each { |p| ohai "iina-builds: applying #{File.basename(p)}"; out = `/usr/bin/patch -p1 -F3 -i #{p} 2>&1`; puts out; raise "iina-builds: patch failed (exit #{$?.exitstatus}): #{p}" unless $?.success? }'
+          SNIPPET="${SNIPPET/__PATCHDIR__/$PATCHDIR}"
+          awk -v snip="$SNIPPET" '/system[[:space:]]+"\.\/configure"/ && !done {print snip; done=1} {print}' "$FORMULA" > "$FORMULA.tmp" && mv "$FORMULA.tmp" "$FORMULA"
+          echo "----- patched formula (context) -----"
+          grep -n -B1 -A1 "iina-builds" "$FORMULA" || { echo "::error::patch injection did not match ./configure line"; exit 1; }
+
+          # Same for mpv-iina: inject patch-apply into its install, right before `meson setup`.
+          # Applies any patches/mpv/*.patch to the mpv source (git checkout) before it is compiled.
+          MPVFORMULA="$(brew formula iina/mpv-iina/mpv-iina)"
+          MPVPATCHDIR="$GITHUB_WORKSPACE/patches/mpv"
+          if compgen -G "$MPVPATCHDIR/*.patch" > /dev/null; then
+            MSNIPPET='    Dir.glob("__PATCHDIR__/*.patch").sort.each { |p| ohai "iina-builds: applying #{File.basename(p)}"; out = `/usr/bin/patch -p1 -F3 -i #{p} 2>&1`; puts out; raise "iina-builds: patch failed (exit #{$?.exitstatus}): #{p}" unless $?.success? }'
+            MSNIPPET="${MSNIPPET/__PATCHDIR__/$MPVPATCHDIR}"
+            awk -v snip="$MSNIPPET" '/system[[:space:]]+"meson",[[:space:]]+"setup"/ && !mdone {print snip; mdone=1} {print}' "$MPVFORMULA" > "$MPVFORMULA.tmp" && mv "$MPVFORMULA.tmp" "$MPVFORMULA"
+            echo "----- patched mpv-iina formula (context) -----"
+            grep -n -B1 -A1 "iina-builds" "$MPVFORMULA" || { echo "::error::mpv patch injection did not match meson setup line"; exit 1; }
+          fi
+
+          # Recent Homebrew refuses to load a third-party tap's formula from source until the tap is
+          # trusted (and our edit makes it doubly untrusted). Trust it AFTER editing so the modified
+          # formula is what we trust.
+          brew trust --tap iina/mpv-iina \
+            || { brew trust --formula iina/mpv-iina/ffmpeg-iina; brew trust --formula iina/mpv-iina/mpv-iina; }
+
+          # Build ONLY the two IINA formulas from source; their leaf deps arrive as fast bottles.
+          # ffmpeg-iina has a tarball url; mpv-iina is HEAD-only (its source is a git branch).
+          brew install --build-from-source ffmpeg-iina
+          brew install --build-from-source --HEAD mpv-iina
+
+          # Produce the @rpath dylib bundle exactly as IINA does -> writes to iina/deps/lib.
+          cd "$GITHUB_WORKSPACE/iina"
+          # IINA's script uses File.exists? (removed in Ruby 3.2+); the runner's Homebrew ruby is
+          # 3.4. Rewrite to File.exist? so it runs regardless of which ruby is first on PATH.
+          perl -pi -e 's/File\.exists\?/File.exist?/g' other/change_lib_dependencies.rb
+          ./other/change_lib_dependencies.rb "$(brew --prefix)" "$(brew --prefix mpv-iina)/lib/libmpv.dylib"
+          echo "----- deps/lib -----"
+          ls -la deps/lib | head -50
+
+      - name: Provision yt-dlp (deps/executable)
+        run: |
+          set -euxo pipefail
+          mkdir -p iina/deps/executable
+          curl -sL "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos" \
+            -o iina/deps/executable/youtube-dl
+          chmod +x iina/deps/executable/youtube-dl
+
+      - name: Reconcile IINA project with the built dylibs
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/iina"
+          # IINA's project pins its prebuilt bundle's dylib sonames; our from-source build produces
+          # current versions + a slightly different set. Remap version-skews and drop libs we don't
+          # build (postproc, x86_64-only gcc_s/stdc++), so both the link and the embed phase match.
+          python3 "$GITHUB_WORKSPACE/scripts/reconcile_dylibs.py" iina.xcodeproj/project.pbxproj deps/lib
+
+      - name: Build IINA.app
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/iina"
+          xcodebuild -project iina.xcodeproj -scheme iina -configuration Nightly \
+            -derivedDataPath build \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGN_IDENTITY=- CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=YES \
+            build
+          # ABSOLUTE path — later steps run from the workspace root, not this iina/ dir.
+          APP="$(find "$PWD/build/Build/Products" -maxdepth 2 -name 'IINA.app' -type d | head -1)"
+          test -n "$APP" || { echo "::error::IINA.app not found"; exit 1; }
+          echo "APP=$APP" >> "$GITHUB_ENV"
+
+      - name: Complete Frameworks bundle
+        run: |
+          set -euxo pipefail
+          # Embed any dylib we built that IINA's project doesn't reference (transitive deps of our
+          # mpv/FFmpeg — e.g. libssh, libudfread). They carry @rpath install names, so dropping them
+          # in Frameworks (= the app's @rpath) makes them loadable at runtime.
+          FW="$APP/Contents/Frameworks"; mkdir -p "$FW"; copied=0
+          for d in "$GITHUB_WORKSPACE/iina/deps/lib/"*.dylib; do
+            b="$(basename "$d")"
+            [ -e "$FW/$b" ] || { cp -p "$d" "$FW/$b"; copied=$((copied+1)); }
+          done
+          echo "embedded $copied extra dylib(s)"
+
+      - name: Ad-hoc sign
+        run: |
+          set -euxo pipefail
+          # Sign inner code first, then the app bundle — `--deep` is deprecated and recent codesign
+          # rejects the bundle with it. Ad-hoc (-) is enough to run a personal build on arm64.
+          find "$APP/Contents/Frameworks" -type f -name '*.dylib' -exec codesign --force --sign - {} +
+          find "$APP/Contents" -type d \( -name '*.framework' -o -name '*.appex' \) -exec codesign --force --sign - {} + 2>/dev/null || true
+          codesign --force --sign - "$APP"
+          codesign --verify --verbose=2 "$APP" || true
+
+      - name: Package
+        run: |
+          set -euxo pipefail
+          tar cJf "$RUNNER_TEMP/IINA.tar.xz" -C "$(dirname "$APP")" IINA.app
+          shasum -a 256 "$RUNNER_TEMP/IINA.tar.xz"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: IINA-patched
+          path: ${{ runner.temp }}/IINA.tar.xz
+          if-no-files-found: error
