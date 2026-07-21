@@ -1,13 +1,14 @@
 name: build
 
-# Builds a custom IINA.app whose bundled dependencies are compiled from source with the
-# patches under patches/ applied. Today that is the FFmpeg MMT/TLV demuxer; the framework is
-# general — drop more .patch files into patches/<dependency>/ and they are applied in order.
+# Builds a custom IINA.app whose bundled dependencies are compiled from source. FFmpeg comes from
+# our MMT/TLV fork branch (saindriches/FFmpeg @ mmt-tlv) for the MMT/TLV demuxer; mpv and IINA still
+# take source patches from patches/mpv/ and patches/iina/ (applied in order).
 #
-# IINA's own CI downloads prebuilt dylibs (other/download_libs.sh -> iina.io). We instead build
-# the two IINA Homebrew formulas (ffmpeg-iina, mpv-iina) FROM SOURCE with our patches, then feed
-# the resulting dylib bundle into IINA's normal xcodebuild. The expensive FFmpeg+mpv build is
-# cached (keyed on the patch set + pinned versions), so ordinary runs skip it.
+# IINA's own CI downloads prebuilt dylibs (other/download_libs.sh -> iina.io). We instead build the
+# two IINA Homebrew formulas (ffmpeg-iina, mpv-iina) FROM SOURCE — retargeting ffmpeg-iina's source
+# at the fork branch, and injecting patches/mpv into mpv-iina — then feed the resulting dylib bundle
+# into IINA's normal xcodebuild. The expensive FFmpeg+mpv build is cached (keyed on the fork commit
+# + patch set + pinned versions), so ordinary runs skip it.
 
 on:
   push:
@@ -32,6 +33,8 @@ env:
   # patches/iina source patch deterministic. Override via the iina_ref input.
   IINA_REF: ${{ github.event.inputs.iina_ref || 'ae76dcf73082c86770ffe0988d7d75d202d723d4' }}
   MPV_TAP_REF: "master"           # iina/homebrew-mpv-iina ref (formulas: ffmpeg-iina, mpv-iina)
+  FFMPEG_REPO: "saindriches/FFmpeg"                           # MMT/TLV FFmpeg fork
+  FFMPEG_REF: "90b4ce9b379ccd56d2c7536681df7bd2b2a0bf9b"      # mmt-tlv branch head; bump to re-sync
   XCODE_VERSION: "26.5"           # matches iina/iina ci.yml
   CACHE_EPOCH: "1"                # bump to bust the deps cache manually
 
@@ -76,40 +79,34 @@ jobs:
           echo "patch_hash=$PATCH_HASH" >> "$GITHUB_OUTPUT"
           echo "IINA $IINA_SHA / patches $PATCH_HASH"
 
-      - name: Restore built dependency bundle (patched FFmpeg + mpv)
+      - name: Restore built dependency bundle (FFmpeg mmt-tlv + mpv)
         id: deps_cache
         if: ${{ github.event.inputs.force_rebuild_deps != 'true' }}
         uses: actions/cache@v4
         with:
           path: iina/deps
-          key: deps-${{ runner.os }}-mpvtap${{ env.MPV_TAP_REF }}-patch${{ steps.keys.outputs.patch_hash }}-epoch${{ env.CACHE_EPOCH }}
+          key: deps-${{ runner.os }}-mpvtap${{ env.MPV_TAP_REF }}-ff${{ env.FFMPEG_REF }}-patch${{ steps.keys.outputs.patch_hash }}-epoch${{ env.CACHE_EPOCH }}
 
-      - name: Build patched FFmpeg + mpv from source
+      - name: Build FFmpeg (mmt-tlv fork) + mpv from source
         if: ${{ steps.deps_cache.outputs.cache-hit != 'true' }}
         run: |
           set -euxo pipefail
-          # The patched formula runs `patch -i <workspace>/patches/...` during its build. Homebrew's
-          # build sandbox denies reads outside the build tree, so patch fails silently (no hunk
-          # rejects — it just can't open the file). Disable the sandbox; this is our own build.
+          # mpv-iina still applies patches/mpv via `patch -i <workspace>/patches/...` during its
+          # build. Homebrew's build sandbox denies reads outside the build tree, so patch fails
+          # silently (it just can't open the file). Disable the sandbox; this is our own build.
+          # (ffmpeg-iina no longer patches — it builds straight from the fork branch.)
           export HOMEBREW_NO_SANDBOX=1
           brew update
           brew tap iina/homebrew-mpv-iina
           FORMULA="$(brew formula ffmpeg-iina)"   # resolves the tapped formula's real path
           test -f "$FORMULA" || { echo "::error::ffmpeg-iina formula not found at '$FORMULA'"; exit 1; }
-          PATCHDIR="$GITHUB_WORKSPACE/patches/ffmpeg"
-
-          # Inject our patch-apply step into ffmpeg-iina's install, right before ./configure.
-          # The Ruby snippet is kept literal (heredoc + awk insert) so #{...} is written into the
-          # formula, not evaluated here. The absolute patch dir is baked in so it doesn't depend on
-          # env propagation into Homebrew's sandbox. Purely additive: any patches/ffmpeg/*.patch.
-          # Use /usr/bin/patch by ABSOLUTE path — Homebrew's curated build PATH doesn't include it,
-          # so `system("patch", ...)` returned nil (patch never ran, hence the silent failure).
-          # Capture + print its output so any real reject is visible.
-          SNIPPET='    Dir.glob("__PATCHDIR__/*.patch").sort.each { |p| ohai "iina-builds: applying #{File.basename(p)}"; out = `/usr/bin/patch -p1 -F3 -i #{p} 2>&1`; puts out; raise "iina-builds: patch failed (exit #{$?.exitstatus}): #{p}" unless $?.success? }'
-          SNIPPET="${SNIPPET/__PATCHDIR__/$PATCHDIR}"
-          awk -v snip="$SNIPPET" '/system[[:space:]]+"\.\/configure"/ && !done {print snip; done=1} {print}' "$FORMULA" > "$FORMULA.tmp" && mv "$FORMULA.tmp" "$FORMULA"
-          echo "----- patched formula (context) -----"
-          grep -n -B1 -A1 "iina-builds" "$FORMULA" || { echo "::error::patch injection did not match ./configure line"; exit 1; }
+          # Retarget ffmpeg-iina's source at our MMT/TLV fork branch (pinned commit) instead of the
+          # release tarball — the MMT/TLV demuxer is in-tree there, so no patch step. Swap the stable
+          # `url` + `sha256` for a git `url` + `revision`, and add an explicit `version` (a git source
+          # cannot derive one). `brew install --build-from-source` then clones the fork at that commit.
+          perl -0pi -e 'my ($r,$f)=($ENV{FFMPEG_REPO},$ENV{FFMPEG_REF}); s{url "https://ffmpeg\.org/releases/ffmpeg-[^"]+\.tar\.xz"\n\s*sha256 "[0-9a-f]+"\n}{url "https://github.com/$r.git", revision: "$f"\n  version "8.0.git"\n} or die "::error::could not retarget ffmpeg-iina source url (formula format changed?)\n"' "$FORMULA"
+          echo "----- retargeted ffmpeg-iina source -----"
+          grep -nE '^\s*(url|revision:|version) ' "$FORMULA" | head
 
           # Same for mpv-iina: inject patch-apply into its install, right before `meson setup`.
           # Applies any patches/mpv/*.patch to the mpv source (git checkout) before it is compiled.
