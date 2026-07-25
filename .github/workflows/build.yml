@@ -34,7 +34,7 @@ env:
   IINA_REF: ${{ github.event.inputs.iina_ref || 'ae76dcf73082c86770ffe0988d7d75d202d723d4' }}
   MPV_TAP_REF: "master"           # iina/homebrew-mpv-iina ref (formulas: ffmpeg-iina, mpv-iina)
   FFMPEG_REPO: "saindriches/FFmpeg"                           # MMT/TLV FFmpeg fork
-  FFMPEG_REF: "90b4ce9b379ccd56d2c7536681df7bd2b2a0bf9b"      # mmt-tlv branch head; bump to re-sync
+  FFMPEG_REF: "f829bc7582312d2eb089ae3a0ef08ca4d9c891b8"      # mmt-tlv branch head; bump to re-sync
   XCODE_VERSION: "26.5"           # matches iina/iina ci.yml
   CACHE_EPOCH: "1"                # bump to bust the deps cache manually
 
