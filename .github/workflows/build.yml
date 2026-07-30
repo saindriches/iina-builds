@@ -16,9 +16,12 @@ on:
     paths: ['patches/**', '.github/workflows/build.yml', 'manifest.env']
   workflow_dispatch:
     inputs:
+      iina_repo:
+        description: "IINA source repo (our fork carries the DeckLink work)"
+        default: "saindriches/iina-avs"
       iina_ref:
         description: "IINA git ref to build against"
-        default: "ae76dcf73082c86770ffe0988d7d75d202d723d4"
+        default: "decklink-clean"
       force_rebuild_deps:
         description: "Ignore the deps cache and rebuild FFmpeg+mpv"
         type: boolean
@@ -29,9 +32,11 @@ permissions:
 
 env:
   # Pinned build inputs — see manifest.env (kept in sync for humans; the workflow reads these).
-  # Pinned to ae76dcf — the last IINA commit before an unrelated regression. Also keeps any future
-  # patches/iina source patch deterministic. Override via the iina_ref input.
-  IINA_REF: ${{ github.event.inputs.iina_ref || 'ae76dcf73082c86770ffe0988d7d75d202d723d4' }}
+  # IINA now comes from our fork rather than upstream: the DeckLink output work lives on the
+  # decklink-clean branch, which is itself based on ae76dcf (the last upstream commit before an
+  # unrelated regression), so the pin is preserved. Override either via the workflow inputs.
+  IINA_REPO: ${{ github.event.inputs.iina_repo || 'saindriches/iina-avs' }}
+  IINA_REF: ${{ github.event.inputs.iina_ref || 'decklink-clean' }}
   MPV_TAP_REF: "master"           # iina/homebrew-mpv-iina ref (formulas: ffmpeg-iina, mpv-iina)
   FFMPEG_REPO: "saindriches/FFmpeg"                           # MMT/TLV FFmpeg fork
   FFMPEG_REF: "f7480a7c44783965367f0988dd6f24370ff1834e"      # mmt-tlv branch head; bump to re-sync
@@ -48,7 +53,7 @@ jobs:
       - name: Checkout IINA
         uses: actions/checkout@v4
         with:
-          repository: iina/iina
+          repository: ${{ env.IINA_REPO }}
           ref: ${{ env.IINA_REF }}
           path: iina
 

@@ -14,11 +14,21 @@ dependency build.
   (based on [SuperFashi's PR #21037](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/21037), plus parser
   hardening, seeking, HEVC extradata, and stream-metadata work). No in-repo ffmpeg patches — the CI
   retargets the `ffmpeg-iina` formula's source at the fork commit pinned in `manifest.env`.
+- **IINA — DeckLink output**: a *Video → DeckLink Output* menu that routes decoded video to a
+  Blackmagic DeckLink / UltraStudio device for reference-monitor viewing, driving the Blackmagic SDK
+  directly (FFmpeg's `decklink` muxer can only emit uyvy422/v210 and would force a non-redistributable
+  `--enable-nonfree` build). Device, video mode, pixel format and levels come from the hardware;
+  scheduled playback or a low-latency immediate-display path. Built from
+  [`saindriches/iina-avs` @ `decklink-clean`](https://github.com/saindriches/iina-avs/tree/decklink-clean),
+  which is based on the pinned upstream commit. Needs Blackmagic Desktop Video installed at runtime;
+  with no driver present the menu simply lists no devices.
 - **mpv — ICC BT.1886 fix** (`patches/mpv/0001`) so SDR video isn't gray with *Load ICC profile* on
   (backport of mpv#17439). Clear mpv's ICC LUT cache once after installing — see
   [`patches/README.md`](patches/README.md).
 
-`IINA_REF` and dependency versions are pinned in [`manifest.env`](manifest.env).
+`IINA_REPO`, `IINA_REF` and dependency versions are pinned in [`manifest.env`](manifest.env). The
+workflow builds IINA from our fork by default; both can be overridden per-run from the Actions form
+(set `iina_repo` to `iina/iina` for a stock build).
 
 ## Build & use
 
@@ -36,6 +46,8 @@ Ad-hoc signed — fine for personal use, not notarized.
 
 - **FFmpeg**: the MMT/TLV work lives in the fork branch, not here. Bump `FFMPEG_REF` in
   [`manifest.env`](manifest.env) and the workflow `env:` to a new `mmt-tlv` commit and push.
-- **mpv / IINA**: drop a `-p1` diff into `patches/mpv/` or `patches/iina/` named
-  `NNNN-description.patch` and push; it's applied to that source before it builds. See
-  [`patches/README.md`](patches/README.md).
+- **IINA**: the DeckLink work lives on the fork branch, not here. Point `iina_repo`/`iina_ref` at a
+  new commit (workflow `env:` plus [`manifest.env`](manifest.env)) and push.
+- **mpv**: drop a `-p1` diff into `patches/mpv/` named `NNNN-description.patch` and push; it's
+  applied to that source before it builds. `patches/iina/` still works the same way for small fixes
+  on top of whatever `iina_repo` is checked out. See [`patches/README.md`](patches/README.md).
